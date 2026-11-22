@@ -112,31 +112,194 @@ _enable_dpi_awareness()
 # 初始化
 pygame.init()
 
-# ---------- 渲染后端选择（命令行 > render.cfg > 默认 gl） ----------
-def _render_cfg_path():
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, "SuperWuGuoChicken")
+# ---------- 存档：所有数据只写一个加密文件 ----------
+# %APPDATA%\SuperWuGuoChicken\data.dat = 16 字节签名 | 纯文本
+# 正文是每行一个 key=value，最土最好改的结构；keys 一行里用 | 分隔四个键位、字段用逗号。
+# 密钥和签名都掺了本机 ID：SHA256(salt|机器ID) 生成密钥流做 XOR，签名是 sha256(body+salt|机器ID) 的前 16 位。
+# 改一个数字、少一个字节，签名立刻对不上，整套回默认；把 data.dat 拷到别的电脑也验不过。
+APP_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "SuperWuGuoChicken")
+DATA_FILE = os.path.join(APP_DIR, "data.dat")
+_SAVE_SALT = "SuperWuGuoChicken/7355608/lock-state/v2".encode("utf-8")   # 旧盐，无设备时代的老文件靠它迁进来
+_STORE_DEFAULT = {"s0": 0, "s1": 0, "c1": 0, "s2": 0, "c2": 0,
+                  "fails": 0, "until": 0.0, "pen": 0, "dis": 0, "render": "gl"}
+_STORE_INT_KEYS = ("s0", "s1", "c1", "c2", "s2", "fails", "pen", "dis")
+_TOUCH_TAGS = ("L", "R", "J", "C")
+_LEGACY_FILES = ("lock.dat", "keys.dat", "render.cfg")
+
+_MACHINE_ID = None
+def machine_id():
+    """本机唯一标识：Windows 取注册表 MachineGuid；Linux 取 machine-id；都不行退回网卡节点号"""
+    global _MACHINE_ID
+    if _MACHINE_ID: return _MACHINE_ID
+    v = ""
     try:
-        os.makedirs(d, exist_ok=True)
-        return os.path.join(d, "render.cfg")
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as hk:
+            v = str(winreg.QueryValueEx(hk, "MachineGuid")[0]).strip()
     except Exception:
-        return None
-RENDER_CFG = _render_cfg_path()
-def load_render_pref():
-    if RENDER_CFG is None: return None
+        v = ""
+    if not v:
+        for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+            try:
+                with open(p, "r", encoding="utf-8") as fh: v = fh.read().strip()
+            except Exception:
+                v = ""
+            if v: break
+    if not v:
+        try:
+            import uuid
+            v = "%012x" % uuid.getnode()
+        except Exception:
+            v = "node-unknown"
+    _MACHINE_ID = v or "node-unknown"
+    return _MACHINE_ID
+
+_SAVE_KEY_LEGACY = hashlib.sha256(_SAVE_SALT).digest()
+def _store_key():
+    return hashlib.sha256(_SAVE_SALT + b"|" + machine_id().encode("utf-8")).digest()
+def _store_salt():
+    return _SAVE_SALT + b"|" + machine_id().encode("utf-8")
+
+def _save_xor(data, key=None):
+    k = _store_key() if key is None else key
+    kl = len(k)
+    return bytes(b ^ k[i % kl] for i, b in enumerate(data))
+
+def _store_dump(d):
+    """把存档拼成纯文本：一行一个字段，键位压成一行"""
+    lines = ["%s=%s" % (k, d.get(k, _STORE_DEFAULT[k])) for k in
+             ("s0", "s1", "c1", "c2", "s2", "fails", "until", "pen", "dis", "render")]
+    keys = d.get("keys")
+    if isinstance(keys, dict):
+        parts = []
+        for tag in _TOUCH_TAGS:
+            v = keys.get(tag)
+            try:
+                if len(v) == 4: parts.append("%s%d,%d,%d,%d" % (tag, int(v[0]), int(v[1]), int(v[2]), int(v[3])))
+            except (TypeError, ValueError):
+                continue
+        if parts: lines.append("keys=" + "|".join(parts))
+    return "\n".join(lines).encode("utf-8")
+
+def _store_parse(body):
+    """读回纯文本；键位形如 keys=L60,837,120,120|R210,837,120,120|..."""
+    d = {}
+    try: text = body.decode("utf-8")
+    except Exception: return d
+    for line in text.splitlines():
+        if "=" not in line: continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip()
+        if k == "keys":
+            for part in v.split("|"):
+                if len(part) < 6 or part[0] not in _TOUCH_TAGS: continue
+                try: nums = [int(x) for x in part[1:].split(",")]
+                except ValueError: continue
+                if len(nums) == 4: d.setdefault("keys", {})[part[0]] = nums
+        elif k in _STORE_DEFAULT or k == "keys":
+            d[k] = v
+    return d
+
+def _store_decode(raw, salt=None):
+    salt = _store_salt() if salt is None else salt
+    sig, sep, body = raw.partition(b"|")
+    if not sep: return None
+    if hashlib.sha256(body + salt).hexdigest()[:16].encode() != sig: return None
+    if body.lstrip().startswith(b"{"):          # 上一版存的 JSON：照收，下次写盘自动转成文本
+        try: return json.loads(body.decode("utf-8"))
+        except Exception: return None
+    return _store_parse(body)
+
+def _store_read():
+    """读 data.dat：先按本机密钥验，失败再退回旧的无设备方案（返回 数据, 是否旧方案, 是否旧JSON）"""
     try:
-        with open(RENDER_CFG, "r", encoding="utf-8") as fh:
-            v = fh.read().strip().lower()
-        return v if v in ("gl", "soft") else None
+        with open(DATA_FILE, "rb") as fh:
+            cipher = fh.read()
     except Exception:
-        return None
-def save_render_pref(key):
-    if RENDER_CFG is None: return False
+        return None, False, False
+    for key, salt, legacy in ((_store_key(), _store_salt(), False),
+                              (_SAVE_KEY_LEGACY, _SAVE_SALT, True)):
+        raw = _save_xor(cipher, key)
+        got = _store_decode(raw, salt)
+        if isinstance(got, dict):
+            return got, legacy, raw.partition(b"|")[2].lstrip().startswith(b"{")
+    return None, False, False
+
+def save_store(d=None):
+    """整份写盘：先写 .tmp 再原子替换，写到一半断电也不会留下半截坏文件"""
+    d = STORE if d is None else d
     try:
-        with open(RENDER_CFG, "w", encoding="utf-8") as fh: fh.write(key)
+        os.makedirs(APP_DIR, exist_ok=True)
+        body = _store_dump(d)
+        sig = hashlib.sha256(body + _store_salt()).hexdigest()[:16].encode()
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "wb") as fh: fh.write(_save_xor(sig + b"|" + body))
+        os.replace(tmp, DATA_FILE)
         return True
     except Exception:
         return False
+
+def _read_legacy(name):
+    # 老文件一定是用旧的无设备密钥写的
+    try:
+        with open(os.path.join(APP_DIR, name), "rb") as fh:
+            return _store_decode(_save_xor(fh.read(), _SAVE_KEY_LEGACY), _SAVE_SALT)
+    except Exception:
+        return None
+
+def load_store():
+    d = dict(_STORE_DEFAULT)
+    got, legacy_key, old_json = _store_read()
+    if isinstance(got, dict):
+        for k in _STORE_INT_KEYS:
+            try: d[k] = int(got[k])
+            except Exception: pass
+        try: d["until"] = float(got["until"])
+        except Exception: pass
+        if got.get("render") in ("gl", "soft"): d["render"] = got["render"]
+        if isinstance(got.get("keys"), dict): d["keys"] = got["keys"]
+    # 老版本把数据拆成 lock.dat / keys.dat / render.cfg（旧 data.dat 只存成绩）
+    # 第一次启动并进来，写成功就把老文件删掉，之后只认 data.dat
+    need_migrate = False
+    if not isinstance(got, dict) or "fails" not in got:
+        r = _read_legacy("lock.dat")
+        if isinstance(r, dict):
+            for k in ("fails", "until", "pen", "dis"):
+                if k in r: d[k] = r[k]
+            need_migrate = True
+    if not isinstance(got, dict) or "keys" not in got:
+        r = _read_legacy("keys.dat")
+        if isinstance(r, dict) and r:
+            d["keys"] = r
+            need_migrate = True
+    if not isinstance(got, dict) or "render" not in got:
+        try:
+            with open(os.path.join(APP_DIR, "render.cfg"), "r", encoding="utf-8") as fh:
+                v = fh.read().strip().lower()
+            if v in ("gl", "soft"):
+                d["render"] = v
+                need_migrate = True
+        except Exception:
+            pass
+    if isinstance(got, dict) and (need_migrate or old_json or legacy_key):
+        # 旧文件、旧 JSON、旧无设备密钥，任一命中都用新方案重写一份
+        if save_store(d):
+            for n in _LEGACY_FILES:
+                try: os.remove(os.path.join(APP_DIR, n))
+                except Exception: pass
+    return d
+
+STORE = load_store()
+
+# ---------- 渲染后端选择（命令行 > data.dat 里存的偏好 > 默认 gl） ----------
+def load_render_pref():
+    v = STORE.get("render")
+    return v if v in ("gl", "soft") else None
+
+def save_render_pref(key):
+    STORE["render"] = "soft" if key == "soft" else "gl"
+    return save_store()
+
 RENDER_BACKEND = (os.environ.get("WUGUO_RENDER") or load_render_pref() or "gl").strip().lower()
 GPU_OK = False
 gpu_win = None
@@ -967,6 +1130,10 @@ update_mapping(*WIN_SIZE())
 def sx(v): return int(off_x + v * scale)
 def sy(v): return int(off_y + v * scale)
 def px(v): return int(round(v * scale))   # 只算像素、不带偏移，供统一世界偏移使用
+def touch_xy(event):
+    """FINGER 事件给的是窗口比例坐标，换成设计画布坐标（把黑边偏移和缩放一起算掉）"""
+    w_, h_ = WIN_SIZE()
+    return ((event.x * w_ - off_x) / scale, (event.y * h_ - off_y) / scale)
 def world_x(x):
     # 世界坐标→窗口x：三模式减镜头；零/一模式没有镜头，直接用世界坐标（背景相位与它无关）
     # 旧写法把 px(bg_x) 与 round(x-bg_x) 两个独立取整相加，会产生 0/-1/+1 三帧锯齿抖动，已去掉
@@ -1243,12 +1410,12 @@ class GlassButton:
             # 鼠标坐标已经提前转换为虚拟画布坐标
             if self.rect.collidepoint(event.pos): self.pressed = True
         elif event.type == pygame.FINGERDOWN:
-            tx, ty = event.x * DESIGN_W, event.y * DESIGN_H
+            tx, ty = touch_xy(event)
             if self.rect.collidepoint((tx, ty)): self.pressed = True
         elif event.type in (pygame.MOUSEBUTTONUP, pygame.FINGERUP):
             if self.pressed:
                 self.pressed = False
-                pos = event.pos if event.type == pygame.MOUSEBUTTONUP else (event.x * DESIGN_W, event.y * DESIGN_H)
+                pos = event.pos if event.type == pygame.MOUSEBUTTONUP else touch_xy(event)
                 if self.rect.collidepoint(pos): return True
         elif event.type == pygame.MOUSEMOTION and self.pressed:
             if not self.rect.collidepoint(event.pos): self.pressed = False
@@ -1324,7 +1491,7 @@ class InputBox:
             self.active = hit
             self.sel_all = hit            # 点一下就整段选中，敲的新值直接顶替旧值
         if event.type == pygame.FINGERDOWN:
-            tx, ty = event.x * DESIGN_W, event.y * DESIGN_H
+            tx, ty = touch_xy(event)
             hit = self.rect.collidepoint((tx, ty))
             if self.active and not hit:
                 self._commit(self.text)
@@ -1413,7 +1580,7 @@ class Slider:
         self.value = max(self.RANGE_MIN, min(self.RANGE_MAX, float(v)))
     def handle_event(self, event):
         pos = event.pos if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEMOTION) else \
-              (event.x * DESIGN_W, event.y * DESIGN_H) if event.type in (pygame.FINGERDOWN, pygame.FINGERMOTION) else (-1, -1)
+              touch_xy(event) if event.type in (pygame.FINGERDOWN, pygame.FINGERMOTION) else (-1, -1)
         if event.type in (pygame.MOUSEBUTTONDOWN, pygame.FINGERDOWN):
             if self.rect.inflate(20, 20).collidepoint(pos):
                 self.dragging = True
@@ -1442,6 +1609,8 @@ _key_cache = {}
 _lock_dim = None
 _stats_bg = None       # 数据页背景：把设置页整页模糊后缓存一次
 _stats_bg_size = None
+_confirm_bg = None     # 清除数据确认层背景：把数据页整页模糊后缓存一次
+_confirm_bg_size = None
 _stats_dim = None      # 数据页压暗层（按窗口尺寸缓存）
 _lock_dim_hard = None
 _lock_box_cache = {}
@@ -1474,63 +1643,31 @@ class LockPadKey:
 LOCK_TARGET = "7355608"
 lock_input = ""
 lock_err = 0
-# ---------- 失败惩罚（加密写入 AppData，重启无效绕不过） ----------
-LOCK_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "SuperWuGuoChicken")
-LOCK_FILE = os.path.join(LOCK_DIR, "lock.dat")
-_LK_SALT = "SuperWuGuoChicken/7355608/lock-state/v2".encode("utf-8")
-def _lk_xor(data):
-    k = hashlib.sha256(_LK_SALT).digest()
-    kl = len(k)
-    return bytes(b ^ k[i % kl] for i, b in enumerate(data))
+# ---------- 失败惩罚（写在 data.dat 里，重启无效绕不过） ----------
 def load_lock_state():
-    try:
-        with open(LOCK_FILE, "rb") as f:
-            raw = _lk_xor(f.read())
-        sig, sep, body = raw.partition(b"|")
-        if not sep: return 0, 0.0, 0, 0
-        if hashlib.sha256(body + _LK_SALT).hexdigest()[:16].encode() != sig:
-            return 0, 0.0, 0, 0          # 被改过就当作没锁
-        d = json.loads(body.decode("utf-8"))
-        return int(d.get("fails", 0)), float(d.get("until", 0)), int(d.get("pen", 0)), int(d.get("dis", 0))
-    except Exception:
-        return 0, 0.0, 0, 0
+    return (int(STORE.get("fails", 0)), float(STORE.get("until", 0)),
+            int(STORE.get("pen", 0)), int(STORE.get("dis", 0)))
 def save_lock_state(fails, until, pen=0, dis=0):
-    try:
-        os.makedirs(LOCK_DIR, exist_ok=True)
-        body = json.dumps({"fails": fails, "until": until, "pen": int(pen), "dis": int(dis)},
-                          separators=(",", ":")).encode("utf-8")
-        sig = hashlib.sha256(body + _LK_SALT).hexdigest()[:16].encode()
-        with open(LOCK_FILE, "wb") as f:
-            f.write(_lk_xor(sig + b"|" + body))
-    except Exception:
-        pass
+    STORE["fails"] = int(fails)
+    STORE["until"] = float(until)
+    STORE["pen"] = int(pen)
+    STORE["dis"] = int(dis)
+    save_store()
 lock_fails, lock_until, lock_pen, lock_dis = load_lock_state()
-# ---------- 历史最高成绩（同样是加密 + 验签的二进制文件） ----------
-STAT_FILE = os.path.join(LOCK_DIR, "data.dat")
+# ---------- 历史最高成绩（和惩罚状态同一个文件） ----------
 def load_stats():
-    try:
-        with open(STAT_FILE, "rb") as f:
-            raw = _lk_xor(f.read())
-        sig, sep, body = raw.partition(b"|")
-        if not sep: return {"s0": 0, "s1": 0, "c1": 0, "s2": 0, "c2": 0}
-        if hashlib.sha256(body + _LK_SALT).hexdigest()[:16].encode() != sig:
-            return {"s0": 0, "s1": 0, "c1": 0, "s2": 0, "c2": 0}
-        d = json.loads(body.decode("utf-8"))
-        return {"s0": int(d.get("s0", 0)), "s1": int(d.get("s1", 0)), "c1": int(d.get("c1", 0)),
-                "s2": int(d.get("s2", 0)), "c2": int(d.get("c2", 0))}
-    except Exception:
-        return {"s0": 0, "s1": 0, "c1": 0, "s2": 0, "c2": 0}
+    return {k: int(STORE.get(k, 0)) for k in ("s0", "s1", "c1", "s2", "c2")}
 def save_stats(d):
-    try:
-        os.makedirs(LOCK_DIR, exist_ok=True)
-        body = json.dumps({k: int(d.get(k, 0)) for k in ("s0", "s1", "c1", "s2", "c2")},
-                          separators=(",", ":")).encode("utf-8")
-        sig = hashlib.sha256(body + _LK_SALT).hexdigest()[:16].encode()
-        with open(STAT_FILE, "wb") as f:
-            f.write(_lk_xor(sig + b"|" + body))
-    except Exception:
-        pass
+    for k in ("s0", "s1", "c1", "s2", "c2"):
+        STORE[k] = int(d.get(k, 0))
+    save_store()
 best_stats = load_stats()
+def clear_game_data():
+    # 只清成绩和金币。锁屏失败记录、惩罚档、后端偏好、触屏键位全部原样保留：
+    # 清一下就能把惩罚抹掉，等于给锁屏开了后门
+    for k in ("s0", "s1", "c1", "s2", "c2"):
+        best_stats[k] = 0
+    save_stats(best_stats)
 run_cheated = False          # 这一局只要开过任何一个作弊开关，整局成绩作废
 def mark_cheated():
     global run_cheated
@@ -1612,7 +1749,7 @@ def handle_lock_events(event):
         elif event.unicode and event.unicode.isprintable() and len(lock_input) < 24:
             lock_input += event.unicode
     pos = event.pos if event.type == pygame.MOUSEBUTTONDOWN else \
-          (event.x * DESIGN_W, event.y * DESIGN_H) if event.type == pygame.FINGERDOWN else None
+          touch_xy(event) if event.type == pygame.FINGERDOWN else None
     if pos:
         for k in lock_pad:
             if k.code in ("ok", "del") and not lock_input: continue   # 没输入内容时不出「好」和删除键
@@ -1741,8 +1878,19 @@ btn_exit = GlassButton(exit_btn_rect, "退出游戏", font_size=font, is_dark=Fa
 btn_mode = GlassButton(mode_btn_rect, "跑步鸡", font_size=font, is_dark=False)
 stats_btn_rect = pygame.Rect(DESIGN_W - 350, 112, 300, 60)
 btn_stats = GlassButton(stats_btn_rect, "游戏数据", font_size=font, is_dark=False)
-stats_close_rect = pygame.Rect(DESIGN_W // 2 - 180, 830, 360, 80)
+stats_close_rect = pygame.Rect(DESIGN_W // 2 - 400, 830, 360, 80)
 btn_stats_close = GlassButton(stats_close_rect, "关闭", font_size=font, is_dark=False)
+stats_clear_rect = pygame.Rect(DESIGN_W // 2 + 40, 830, 360, 80)
+btn_stats_clear = GlassButton(stats_clear_rect, "清除游戏数据", font_size=font, is_dark=True)
+btn_stats_clear.text_color = (255, 140, 140)
+btn_stats_clear.font_surf = font.render("清除游戏数据", True, btn_stats_clear.text_color)
+stats_confirm = False
+cf_cancel_rect = pygame.Rect(DESIGN_W // 2 - 330, 620, 300, 90)
+cf_ok_rect = pygame.Rect(DESIGN_W // 2 + 30, 620, 300, 90)
+btn_cf_cancel = GlassButton(cf_cancel_rect, "取消", font_size=font, is_dark=False)
+btn_cf_ok = GlassButton(cf_ok_rect, "确认清除", font_size=font, is_dark=True)
+btn_cf_ok.text_color = (255, 126, 126)
+btn_cf_ok.font_surf = font.render("确认清除", True, btn_cf_ok.text_color)
 stats_open = False
 btn_retry = GlassButton(button_rect, "重试", font_size=font, is_dark=True)
 btn_retry.glass_alpha = 225
@@ -1753,6 +1901,70 @@ btn_right = GlassButton(right_btn_rect, "▶", font_size=font_big, is_dark=False
 btn_jump = GlassButton(jump_btn_rect, "▲", font_size=font_big, is_dark=False)
 btn_crouch = GlassButton(crouch_btn_rect, "▼", font_size=font_big, is_dark=False)
 btn_control = GlassButton(control_btn_rect, "设置", font_size=font, is_dark=False)
+
+# ---------- 触屏键位布局：位置 / 大小可自定义，存在 data.dat 的 keys 字段里 ----------
+# 字段是设计坐标 x, y, width, height；安卓版接游戏本体时照抄同一份 JSON 即可复用。
+_TOUCH_KEYS = ("L", "R", "J", "C")
+_TOUCH_DEFAULT = {
+    "L": (60, DESIGN_H - 180, 120, 120),
+    "R": (210, DESIGN_H - 180, 120, 120),
+    "J": (DESIGN_W - 200, DESIGN_H - 370, 150, 150),
+    "C": (DESIGN_W - 200, DESIGN_H - 200, 150, 150),
+}
+_TOUCH_MIN = 60
+_TOUCH_MAX = 460
+
+def _touch_ok(v):
+    try:
+        x, y, w, h = int(v[0]), int(v[1]), int(v[2]), int(v[3])
+    except (TypeError, ValueError, IndexError):
+        return False
+    if w < _TOUCH_MIN or h < _TOUCH_MIN or w > _TOUCH_MAX or h > _TOUCH_MAX: return False
+    return x >= 0 and y >= 0 and x + w <= DESIGN_W and y + h <= DESIGN_H
+
+def load_touch_layout():
+    layout = dict(_TOUCH_DEFAULT)
+    got = STORE.get("keys")
+    if isinstance(got, dict):
+        for k in _TOUCH_KEYS:
+            v = got.get(k)
+            if _touch_ok(v): layout[k] = (int(v[0]), int(v[1]), int(v[2]), int(v[3]))
+    return layout
+
+def save_touch_layout():
+    STORE["keys"] = {k: [int(n) for n in touch_layout[k]] for k in _TOUCH_KEYS}
+    save_store()
+
+touch_layout = load_touch_layout()
+
+def touch_pt(w, h):
+    # 150 的方块算出来正好是 font_big（48），和原版视觉一致
+    return max(18, int(round(min(w, h) * 0.32)))
+
+def sync_touch_buttons():
+    """把布局写进真实按钮：GlassButton 的 rect 是拷贝，必须两边一起更新"""
+    for key, b, r in (("L", btn_left, left_btn_rect), ("R", btn_right, right_btn_rect),
+                      ("J", btn_jump, jump_btn_rect), ("C", btn_crouch, crouch_btn_rect)):
+        x, y, w, h = touch_layout[key]
+        r.update(x, y, w, h)
+        b.rect.update(x, y, w, h)
+        pt = touch_pt(w, h)
+        if b.pt != pt:
+            b.pt = pt
+            b.font = font_pt(pt)
+            b.font_surf = b.font.render(b.text, True, b.text_color)
+
+sync_touch_buttons()
+
+# 设置页里的入口 + 键位编辑页控件
+btn_keylayout = GlassButton(pygame.Rect(1010, 648, 380, 96), "键位控制", font_size=font, is_dark=True)
+kl_card_rect = pygame.Rect(620, 620, 1260, 140)
+btn_kl_save = GlassButton(pygame.Rect(1140, 900, 380, 80), "保存并返回", font_size=font, is_dark=False)
+btn_kl_default = GlassButton(pygame.Rect(880, 900, 240, 80), "恢复默认", font_size=font, is_dark=True)
+btn_kl_cancel = GlassButton(pygame.Rect(620, 900, 240, 80), "取消", font_size=font, is_dark=True)
+kl_drag = None
+kl_pick = None
+
 btn_resume = GlassButton(resume_btn_rect, "继续游戏", font_size=font, is_dark=True)
 btn_resume.glass_alpha = 225
 btn_pause_control = GlassButton(pause_control_btn_rect, "设置", font_size=font, is_dark=True)
@@ -2041,14 +2253,33 @@ def draw_player(screen):
     else: screen.blit(ds(draw_img), (draw_x, off_y + px(game_state["player_y"])))
 # ---------- 5. 事件处理 ----------
 def handle_setup_events(event):
-    global stats_open, _stats_bg
+    global stats_open, _stats_bg, stats_confirm, _confirm_bg
     if stats_open:
-        # 数据面板打开时独占输入，只能按「关闭」或 ESC 退出
+        if stats_confirm:
+            # 二次确认层独占输入：只有「取消」「确认清除」和 ESC 有效
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                stats_confirm = False
+                _confirm_bg = None
+                return "setup"
+            if btn_cf_cancel.handle_event(event):
+                stats_confirm = False
+                _confirm_bg = None
+            elif btn_cf_ok.handle_event(event):
+                stats_confirm = False
+                _confirm_bg = None
+                clear_game_data()
+            return "setup"
+        # 数据面板打开时独占输入，只能按「关闭」「清除游戏数据」或 ESC 退出
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             stats_open = False
+            _confirm_bg = None
             return "setup"
         if btn_stats_close.handle_event(event):
             stats_open = False
+            _confirm_bg = None
+        elif btn_stats_clear.handle_event(event):
+            stats_confirm = True
+            _confirm_bg = None          # 打开时重拍一张数据页的模糊版当背景
         return "setup"
     cfg = [cfg_run, cfg_free, cfg_mario][game_state["game_mode"]]
 
@@ -2115,7 +2346,7 @@ def handle_game_events(event):
             do_jump()
 
     if event.type == pygame.FINGERDOWN:
-        pos = (event.x * DESIGN_W, event.y * DESIGN_H)
+        pos = touch_xy(event)
         if pause_button_rect.collidepoint(pos): return "paused"
         if game_state["input_mode"] == 1:
             if left_btn_rect.collidepoint(pos) and game_state["game_mode"] != 0: game_state["touch_left"] = True
@@ -2163,7 +2394,7 @@ def sync_cfg_into_state():
             game_state[k] = v
 
 def handle_control_events(event):
-    global prev_state, settings_tab, blur_level, _stats_bg, render_pending
+    global prev_state, settings_tab, blur_level, _stats_bg, render_pending, touch_layout
     if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
         return "paused" if prev_state == "paused" else "setup"
     if btn_back.handle_event(event):
@@ -2179,6 +2410,10 @@ def handle_control_events(event):
     if tab == "控制设置":
         if btn_kbd.handle_event(event): game_state["input_mode"] = 0
         if btn_tch.handle_event(event): game_state["input_mode"] = 1
+        if game_state["input_mode"] == 1 and btn_keylayout.handle_event(event):
+            touch_layout = load_touch_layout()      # 进来先丢未保存的草稿
+            sync_touch_buttons()
+            return "keylayout"
     elif tab == "模糊设置":
         if current_backend_key() == "soft":
             return "control_settings"       # 软件加速没有 GPU 模糊，选项只读
@@ -2251,13 +2486,71 @@ def handle_control_events(event):
             game_state["no_damage"] = not game_state["no_damage"]
             if game_state["no_damage"]: mark_cheated()
     return "control_settings"
+
+def handle_keylayout_events(event):
+    global kl_drag, kl_pick, touch_layout
+    if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+        touch_layout = load_touch_layout(); sync_touch_buttons(); kl_drag = None
+        return "control_settings"
+    if btn_kl_cancel.handle_event(event):
+        touch_layout = load_touch_layout(); sync_touch_buttons(); kl_drag = None
+        return "control_settings"
+    if btn_kl_default.handle_event(event):
+        for k in _TOUCH_KEYS: touch_layout[k] = _TOUCH_DEFAULT[k]
+        kl_pick = None
+        return "keylayout"
+    if btn_kl_save.handle_event(event):
+        save_touch_layout(); sync_touch_buttons(); kl_drag = None
+        return "control_settings"
+
+    pos = None
+    if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        pos = event.pos
+    elif event.type == pygame.FINGERDOWN:
+        pos = touch_xy(event)
+    if pos is not None:
+        for k in _TOUCH_KEYS:              # 先判右下角把手，它压在方块上
+            x, y, w, h = touch_layout[k]
+            if pygame.Rect(x + w - 40, y + h - 40, 40, 40).collidepoint(pos):
+                kl_drag = {"mode": "size", "key": k}; kl_pick = k
+                return "keylayout"
+        for k in _TOUCH_KEYS:
+            x, y, w, h = touch_layout[k]
+            if pygame.Rect(x, y, w, h).collidepoint(pos):
+                kl_drag = {"mode": "move", "key": k, "ox": pos[0] - x, "oy": pos[1] - y}
+                kl_pick = k
+                return "keylayout"
+        kl_drag, kl_pick = None, None
+        return "keylayout"
+
+    if kl_drag is not None:
+        if event.type == pygame.MOUSEMOTION and not event.buttons[0]:
+            kl_drag = None               # 鼠标在窗口外松开时收尾
+            return "keylayout"
+        p = None
+        if event.type == pygame.MOUSEMOTION: p = event.pos
+        elif event.type == pygame.FINGERMOTION: p = touch_xy(event)
+        if p is not None:
+            k = kl_drag["key"]; x, y, w, h = touch_layout[k]
+            if kl_drag["mode"] == "move":
+                nx = min(max(0.0, p[0] - kl_drag["ox"]), DESIGN_W - w)
+                ny = min(max(0.0, p[1] - kl_drag["oy"]), DESIGN_H - h)
+                touch_layout[k] = (int(round(nx)), int(round(ny)), w, h)
+            else:
+                nw = min(max(_TOUCH_MIN, p[0] - x), min(_TOUCH_MAX, DESIGN_W - x))
+                nh = min(max(_TOUCH_MIN, p[1] - y), min(_TOUCH_MAX, DESIGN_H - y))
+                touch_layout[k] = (x, y, int(round(nw)), int(round(nh)))
+        if event.type in (pygame.MOUSEBUTTONUP, pygame.FINGERUP):
+            kl_drag = None
+    return "keylayout"
 event_handlers = {
     "lock": handle_lock_events,
     "setup": handle_setup_events,
     "game": handle_game_events,
     "paused": handle_paused_events,
     "gameover": handle_gameover_events,
-    "control_settings": handle_control_events
+    "control_settings": handle_control_events,
+    "keylayout": handle_keylayout_events
 }
 # ---------- 6. 主循环 ----------
 def refresh_ui_scale():
@@ -2670,6 +2963,40 @@ while running:
                     ui_line(screen, (255, 255, 255, 40), (sx(DESIGN_W // 2 - 430), sy(ly + 70)),
                                      (sx(DESIGN_W // 2 + 430), sy(ly + 70)), max(1, px(1)))
             btn_stats_close.draw(screen, blur_surf)
+            btn_stats_clear.draw(screen, blur_surf)
+            if stats_confirm:
+                # 确认层背景 = 数据页整页的模糊版：弹层里要什么都能糊掉，只有面板和前后的字是清的
+                if _confirm_bg is None or _confirm_bg_size != WIN_SIZE():
+                    sw, sh = WIN_SIZE()
+                    if GPU_OK:
+                        page = gpu_renderer.to_surface()
+                        tmp_tex = tex_from_surface(page)
+                        bgtex = new_tex((sw, sh), target=True)
+                        tex, tw, th = blur_region(tmp_tex, pygame.Rect(0, 0, sw, sh), sw, sh,
+                                                  radius=page_blur_px(), dst_tex=bgtex)
+                        tmp_tex.destroy()
+                        _confirm_bg = GpuBlur(tex, sw, sh)
+                    else:
+                        k_ = max(2, int(round(14 * blur_mul())))
+                        tiny = pygame.transform.smoothscale(screen, (max(1, sw // k_), max(1, sh // k_)))
+                        _confirm_bg = pygame.transform.smoothscale(tiny, (sw, sh))
+                    _confirm_bg_size = (sw, sh)
+                screen.blit(_confirm_bg, (0, 0))
+                # 只压一层淡暗（和数据页的 168 同档略收一点）：面板是玻璃，底下那张整页模糊要能透上来
+                ui_fill_alpha(screen, pygame.Rect(0, 0, DESIGN_W, DESIGN_H), (5, 5, 5, 125))
+                panel = pygame.Rect(DESIGN_W // 2 - 430, 396, 860, 344)
+                # 面板 = 一整块玻璃：底从刚才算好的整页模糊里切（用现成的 BlurEngine 结果，不另外再糊一次），
+                # 面叠淡白 30（和数据页卡片同一档），边一圈 1px 高光
+                draw_ios_glass(screen, panel, _confirm_bg, is_pressed=False, is_dark=False, light_alpha=5)
+                c_title = text_surf(font_big, "清除游戏数据？", (255, 126, 126))
+                screen.blit(c_title, c_title.get_rect(center=(sx(DESIGN_W // 2), sy(466))))
+                c_l1 = text_surf(font, "三个模式的最高分和金币会归零。", (225, 225, 225))
+                screen.blit(c_l1, c_l1.get_rect(center=(sx(DESIGN_W // 2), sy(534))))
+                c_l2 = text_surf(font, "不影响其他数据", (150, 150, 150))
+                screen.blit(c_l2, c_l2.get_rect(center=(sx(DESIGN_W // 2), sy(574))))
+                # 两个按钮照抄数据页那一对：取消 = 亮玻璃（同「关闭」），确认清除 = 暗玻璃 + 红字（同「清除游戏数据」）
+                btn_cf_cancel.draw(screen, _confirm_bg)
+                btn_cf_ok.draw(screen, _confirm_bg)
     elif state == "game":
         b_surf = blur_engine   # 游戏内只需按钮区域的模糊，交给 draw_ios_glass 按区域计算
         btn_pause.draw(screen, b_surf)
@@ -2743,6 +3070,13 @@ while running:
             tip = text_surf(font_small, "键盘：空格跳跃，A/D 移动，Shift下蹲    触屏：方向键 + ▲跳跃/ ▼下蹲",
                             (215, 215, 215))
             screen.blit(tip, tip.get_rect(left=sx(660), centery=sy(588)))
+            if game_state["input_mode"] == 1:      # 键盘模式下不出现
+                ui_fill_alpha(screen, kl_card_rect, (255, 255, 255, 26))
+                kl_lab = text_surf(font, "触屏键位", (255, 255, 255))
+                screen.blit(kl_lab, kl_lab.get_rect(left=sx(660), centery=sy(kl_card_rect.centery)))
+                btn_keylayout.rect = pygame.Rect(1010, 648, 380, 96)
+                style_option(btn_keylayout, False)
+                btn_keylayout.draw(screen, blur_surf)
 
         elif tab == "模糊设置":
             ui_fill_alpha(screen, pygame.Rect(620, 220, 1260, 300), (255, 255, 255, 26))
@@ -2887,6 +3221,46 @@ while running:
 
         btn_back.rect.update(60, 880, 460, 80)
         btn_back.draw(screen, blur_surf)
+
+    elif state == "keylayout":
+        blur_surf = get_tinted_blur(screen, "keylayout", (0, 0, 0, 150))
+        screen.blit(blur_surf, (0, 0))
+        ui_fill_alpha(screen, pygame.Rect(0, 0, DESIGN_W, DESIGN_H), (8, 10, 14, 196))
+        ui_rect(screen, (255, 255, 255, 48), srect(pygame.Rect(0, 0, DESIGN_W, DESIGN_H)), max(1, px(1)))
+
+        t = text_surf(font_big, "键位控制", (255, 255, 255))
+        screen.blit(t, t.get_rect(left=sx(60), top=sy(40)))
+        kl_tips = ("拖动方块 = 移动位置，拖右下角小方块 = 改大小",)
+        for i, line in enumerate(kl_tips):
+            s = text_surf(font_small, line, (212, 212, 212))
+            screen.blit(s, s.get_rect(left=sx(60), top=sy(100 + i * 30)))
+
+        names = {"L": "向后", "R": "向前", "J": "跳跃", "C": "蹲下"}
+        glyphs = {"L": "◀", "R": "▶", "J": "▲", "C": "▼"}
+        for k in _TOUCH_KEYS:
+            x, y, w, h = touch_layout[k]
+            r = pygame.Rect(x, y, w, h)
+            draw_ios_glass(screen, r, blur_surf, is_pressed=False, is_dark=False)
+            g = text_surf(font_pt(touch_pt(w, h)), glyphs[k], (30, 34, 40))
+            screen.blit(g, g.get_rect(center=(sx(x + w // 2), sy(y + h // 2))))
+            if k == kl_pick:
+                ui_rect(screen, (255, 255, 255, 210), srect(r), max(2, px(2)))
+            hr = pygame.Rect(x + w - 40, y + h - 40, 40, 40)
+            ui_fill_alpha(screen, hr, (255, 255, 255, 80))
+            ui_rect(screen, (255, 255, 255, 200), srect(hr), max(1, px(1)))
+
+        # 选中方块的实时数值放左上角，别压在方块或按钮上
+        if kl_pick:
+            x, y, w, h = touch_layout[kl_pick]
+            info = "%s：x=%d  y=%d  宽=%d  高=%d" % (names[kl_pick], x, y, w, h)
+        else:
+            info = "点住任意方块开始编辑"
+        info_surf = text_surf(font, info, (255, 215, 60))
+        screen.blit(info_surf, info_surf.get_rect(left=sx(60), top=sy(100 + len(kl_tips) * 30 + 8)))
+
+        btn_kl_cancel.draw(screen, blur_surf)
+        btn_kl_default.draw(screen, blur_surf)
+        btn_kl_save.draw(screen, blur_surf)
 
     # 黑边保持纯黑：整屏模糊层会从画布往外渗一圈，最后一步把边条重新涂死
     if off_x > 1 or off_y > 1:
